@@ -1,0 +1,19 @@
+{
+  "name": "auto-twibbon",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ubah bingkai PNG/PDF jadi Twibbon siap pakai. Semua diproses di perangkat.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource-variable/plus-jakarta-sans": "^5.3.0",
+    "pdfjs-dist": "^6.4.299"
+  },
+  "devDependencies": {
+    "vite": "^6.4.4"
+  }
+}
