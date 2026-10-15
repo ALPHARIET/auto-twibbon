@@ -4,7 +4,7 @@ import {
   FRAME_IMAGES, PHOTO_IMAGES,
 } from './files.js';
 import { detectHole } from './detect.js';
-import { floodRemoval, autoSeed, pickTolerance } from './fill.js';
+import { floodRemoval, autoSeed, pickTolerance, fitCircle, carveCircle, STEPS, LEAK_GROWTH } from './fill.js';
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
@@ -27,6 +27,9 @@ const state = {
   frame: document.createElement('canvas'), // bingkai setelah area putih dihapus
   area: null, // { x, y, w, h } relatif 0..1: kotak tempat foto diletakkan; null = belum ada
   seeds: [], // titik relatif yang diketuk (atau terdeteksi otomatis)
+  box: null, // kotak area foto yang diatur manual (relatif); null = otomatis dari area terhapus
+  shape: 'rect', // 'circle' = lingkaran di dalam kotak (lubang bulat), 'rect' = kotak
+  initialShape: 'rect',
   srcData: null, // piksel bingkai sumber (cache untuk flood fill)
   small: null, // salinan kecil bingkai untuk mencari toleransi dengan cepat
   fillCache: null,
@@ -57,7 +60,7 @@ function sourceData() {
   return state.srcData;
 }
 
-/** Salinan bingkai maks. 640 px tanpa pencampuran warna (nearest neighbour). */
+/** Salinan bingkai maks. 640 px (dihaluskan, agar gradasi tipis penghubung area tetap terlihat). */
 function smallData() {
   if (!state.small) {
     const k = Math.min(1, 640 / Math.max(W(), H()));
@@ -65,7 +68,7 @@ function smallData() {
     const c = document.createElement('canvas');
     c.width = w; c.height = h;
     const g = c.getContext('2d', { willReadFrequently: true });
-    g.imageSmoothingEnabled = false;
+    g.imageSmoothingQuality = 'high';
     g.drawImage(state.source, 0, 0, w, h);
     state.small = { data: g.getImageData(0, 0, w, h).data, w, h };
   }
@@ -81,7 +84,23 @@ function toleranceFor(seed) {
   const tol = pickTolerance(s.data, s.w, s.h, seed);
   if (s.w === W()) return tol;
   const { count } = floodRemoval(s.data, s.w, s.h, [{ ...seed, tol }], tol, { feather: false });
-  return count < 200 ? pickTolerance(sourceData(), W(), H(), seed) : tol;
+  return count < 200 ? pickTolerance(sourceData(), W(), H(), seed) : verifyTolerance(seed, tol);
+}
+
+/**
+ * Cek ulang toleransi di resolusi penuh: jembatan gradasi tipis bisa hilang di salinan kecil.
+ * Bila area masih melompat dibanding satu langkah lebih ketat, turunkan toleransinya.
+ */
+function verifyTolerance(seed, tol) {
+  const count = (t) => floodRemoval(sourceData(), W(), H(), [{ ...seed, tol: t }], t, { feather: false }).count;
+  let cur = count(tol);
+  for (let j = STEPS.indexOf(tol) - 1; j >= 0; j--) {
+    const lower = count(STEPS[j]);
+    if (cur / lower - 1 <= LEAK_GROWTH) break;
+    tol = STEPS[j];
+    cur = lower;
+  }
+  return tol;
 }
 
 /** Hasil flood fill untuk titik-titik saat ini (di-cache selama titiknya sama). */
@@ -93,6 +112,67 @@ function fillResult() {
   return state.fillCache.res;
 }
 
+/** Lingkaran yang cocok dengan tepi lubang (di-cache bersama hasil flood fill), atau null. */
+function holeCircle() {
+  const cache = state.fillCache;
+  if (cache.circle === undefined) {
+    const res = cache.res;
+    cache.circle = res.bbox ? fitCircle(res.region, W(), H(), res.bbox) : null;
+  }
+  return cache.circle;
+}
+
+const framePad = () => Math.max(2, Math.round(Math.min(W(), H()) * 0.005));
+
+/** Warna lubang yang dikunci (titik pertama yang bukan lubang transparan), atau null. */
+function baseColor() {
+  const d = sourceData();
+  for (const sd of state.seeds) {
+    const o = (Math.min(H() - 1, Math.floor(sd.y * H())) * W() + Math.min(W() - 1, Math.floor(sd.x * W()))) * 4;
+    if (d[o + 3] > 15) return { r: d[o], g: d[o + 1], b: d[o + 2], a: d[o + 3] };
+  }
+  return null;
+}
+
+/**
+ * Mode bulat: penghapusan yang dirapikan secara geometris (lingkaran sampai tepi lubang asli,
+ * tepi mulus). Di-cache per hasil flood fill + lingkaran. Mengembalikan { rem, cx, cy, r }.
+ */
+function circleCut(res) {
+  const cache = state.fillCache;
+  let circle, grow;
+  if (state.box) {
+    const b = areaPxOf(state.box);
+    circle = { cx: b.x + b.w / 2, cy: b.y + b.h / 2, r: Math.min(b.w, b.h) / 2 };
+    grow = false;
+  } else {
+    circle = holeCircle();
+    if (!circle) { // lubang tidak bulat sempurna: lingkaran terbesar di dalam kotak pembatasnya
+      const b = res.bbox;
+      circle = { cx: (b.x + b.w / 2) * W(), cy: (b.y + b.h / 2) * H(), r: Math.min(b.w * W(), b.h * H()) / 2 };
+    }
+    grow = true;
+  }
+  const key = `${circle.cx},${circle.cy},${circle.r},${grow}`;
+  if (cache.cut?.key !== key) {
+    const rem = new Uint8Array(res.rem);
+    const base = baseColor();
+    const r = base ? carveCircle(sourceData(), W(), H(), rem, circle, base, { grow, region: res.region }) : circle.r;
+    cache.cut = { key, rem, cx: circle.cx, cy: circle.cy, r };
+  }
+  return cache.cut;
+}
+
+const areaPxOf = (a) => ({ x: a.x * W(), y: a.y * H(), w: a.w * W(), h: a.h * H() });
+
+/** Kotak otomatis (piksel) untuk mode kotak: kotak pembatas area, sedikit dilebarkan. */
+function rectBoxPx(res) {
+  const pad = framePad();
+  const x0 = Math.max(0, res.bbox.x * W() - pad), y0 = Math.max(0, res.bbox.y * H() - pad);
+  const x1 = Math.min(W(), (res.bbox.x + res.bbox.w) * W() + pad), y1 = Math.min(H(), (res.bbox.y + res.bbox.h) * H() + pad);
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
 function rebuildFrame() {
   const f = state.frame;
   if (f.width !== W() || f.height !== H()) { f.width = W(); f.height = H(); }
@@ -102,21 +182,42 @@ function rebuildFrame() {
   if (!state.seeds.length) { c.drawImage(state.source, 0, 0); return; }
 
   const res = fillResult();
+  if (!res.bbox) { c.drawImage(state.source, 0, 0); return; }
+  let rem = res.rem;
+  let disk = null;
+  if (state.shape === 'circle') {
+    // Lingkaran di dalam kotak: hapus hanya di dalam lingkaran, tepi mulus sampai batas lubang asli.
+    const cut = circleCut(res);
+    rem = cut.rem;
+    const r = cut.r + (state.box ? 0 : Math.max(1, framePad() / 2));
+    disk = { cx: cut.cx, cy: cut.cy, r: cut.r + 1 };
+    state.area = state.box ? { ...state.box } : { x: (cut.cx - r) / W(), y: (cut.cy - r) / H(), w: (2 * r) / W(), h: (2 * r) / H() };
+  } else if (state.box) {
+    state.area = { ...state.box };
+  } else {
+    // Foto diletakkan di kotak ini, sedikit dilebarkan agar menutup tepi halus; kelebihannya tertutup bingkai.
+    const b = rectBoxPx(res);
+    state.area = { x: b.x / W(), y: b.y / H(), w: b.w / W(), h: b.h / H() };
+  }
   const out = new ImageData(new Uint8ClampedArray(sourceData()), W(), H());
   const d = out.data;
-  for (let i = 0; i < res.rem.length; i++) {
-    if (res.rem[i]) d[i * 4 + 3] = (d[i * 4 + 3] * (255 - res.rem[i])) / 255;
+  let edited = false;
+  for (let i = 0; i < rem.length; i++) {
+    let v = rem[i];
+    if (!v) continue;
+    if (disk) {
+      // Warna lubang yang tersambung ke luar lingkaran (gelombang, garis logo) tidak dihapus.
+      const x = i % W(), y = (i - x) / W();
+      const cov = clamp(disk.r + 0.5 - Math.hypot(x + 0.5 - disk.cx, y + 0.5 - disk.cy), 0, 1);
+      v = Math.round(v * cov);
+      if (!v) continue;
+    }
+    d[i * 4 + 3] = (d[i * 4 + 3] * (255 - v)) / 255;
+    edited = true;
   }
-  c.putImageData(out, 0, 0);
-  if (!res.bbox) return;
-  // Foto diletakkan di kotak pembatas area, sedikit dilebarkan agar menutup tepi yang halus;
-  // kelebihannya tertutup bingkai.
-  const pad = Math.max(2, Math.round(Math.min(W(), H()) * 0.005));
-  const x0 = Math.max(0, res.bbox.x * W() - pad);
-  const y0 = Math.max(0, res.bbox.y * H() - pad);
-  const x1 = Math.min(W(), (res.bbox.x + res.bbox.w) * W() + pad);
-  const y1 = Math.min(H(), (res.bbox.y + res.bbox.h) * H() + pad);
-  state.area = { x: x0 / W(), y: y0 / H(), w: (x1 - x0) / W(), h: (y1 - y0) / H() };
+  // Lubang yang sudah transparan: pakai bingkai apa adanya (tanpa salin ulang piksel).
+  if (edited) c.putImageData(out, 0, 0);
+  else c.drawImage(state.source, 0, 0);
 }
 
 function setFrame(canvas, { shared = false } = {}) {
@@ -126,35 +227,102 @@ function setFrame(canvas, { shared = false } = {}) {
   state.fillCache = null;
   const hole = detectHole(canvas);
   const auto = hole ? null : autoSeed(smallData().data, smallData().w, smallData().h);
+  if (auto && smallData().w !== W()) auto.tol = verifyTolerance(auto, auto.tol);
   const seed = hole || auto;
   state.detected = hole ? 'hole' : auto ? 'fill' : null;
   state.seeds = seed ? [seed] : [];
+  state.box = null;
   state.initialSeeds = [...state.seeds];
   state.history = [];
+  // Lubang yang bulat otomatis memakai mode lingkaran-dalam-kotak; bentuk lain memakai kotak.
+  state.shape = state.seeds.length && fillResult().bbox && holeCircle() ? 'circle' : 'rect';
+  state.initialShape = state.shape;
   rebuildFrame();
   if (state.photo && state.area) resetPos();
   el.view.hidden = false;
   el.drop.hidden = true;
   layoutView();
-  // Peserta dari tautan langsung ke langkah foto bila area sudah jelas.
-  goStep(shared && state.area ? 3 : 2);
+  // Bingkai yang lubangnya sudah transparan tidak perlu diedit: langsung ke langkah foto.
+  // Begitu juga peserta dari tautan bila areanya sudah jelas.
+  goStep(state.area && (state.detected === 'hole' || shared) ? 3 : 2);
+  if (state.detected === 'hole') toast('Bingkai sudah transparan, langsung pasang foto.');
 }
 
 function pushHistory() {
-  state.history.push([...state.seeds]);
+  state.history.push({ seeds: [...state.seeds], box: state.box && { ...state.box }, shape: state.shape });
   if (state.history.length > 30) state.history.shift();
 }
 
 function undo() {
   const prev = state.history.pop();
   if (!prev) return;
-  state.seeds = prev;
+  state.seeds = prev.seeds;
+  state.box = prev.box;
+  state.shape = prev.shape;
   areaChanged();
 }
 
 function resetArea() {
   pushHistory();
   state.seeds = [...state.initialSeeds];
+  state.box = null;
+  state.shape = state.initialShape;
+  areaChanged();
+}
+
+function setShape(shape) {
+  if (shape === state.shape || !state.source) return;
+  pushHistory();
+  state.shape = shape;
+  state.box = null;
+  areaChanged();
+}
+
+/* ---------- Kotak area foto yang bisa diatur ---------- */
+
+const HANDLES = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
+const CURSORS = { nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize', n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize', move: 'move' };
+
+function handlePoints(r) {
+  const mx = r.x + r.w / 2, my = r.y + r.h / 2, x1 = r.x + r.w, y1 = r.y + r.h;
+  return { nw: [r.x, r.y], n: [mx, r.y], ne: [x1, r.y], e: [x1, my], se: [x1, y1], s: [mx, y1], sw: [r.x, y1], w: [r.x, my] };
+}
+
+/** Titik pegangan yang tersentuh, 'move' bila di dalam kotak, atau null. */
+const activeHandles = () => (state.shape === 'circle' ? HANDLES.filter((h) => h.length === 2) : HANDLES);
+
+function hitBox(p, touch) {
+  if (!state.area) return null;
+  const r = areaPx();
+  const tol = (touch ? 22 : 12) / cssPerPx;
+  const pts = handlePoints(r);
+  for (const h of activeHandles()) {
+    const [x, y] = pts[h];
+    if (Math.abs(p.x - x) <= tol && Math.abs(p.y - y) <= tol) return h;
+  }
+  return p.x > r.x && p.x < r.x + r.w && p.y > r.y && p.y < r.y + r.h ? 'move' : null;
+}
+
+/** Ubah kotak dari posisi awal `from` (px) sesuai pegangan dan pergeseran pointer. */
+function adjustBox(from, handle, dx, dy) {
+  const min = Math.max(24, Math.min(W(), H()) * 0.05);
+  let x0 = from.x, y0 = from.y, x1 = from.x + from.w, y1 = from.y + from.h;
+  if (handle === 'move') {
+    const nx = clamp(x0 + dx, 0, W() - from.w), ny = clamp(y0 + dy, 0, H() - from.h);
+    x1 += nx - x0; y1 += ny - y0; x0 = nx; y0 = ny;
+  } else {
+    if (handle.includes('w')) x0 = clamp(x0 + dx, 0, x1 - min);
+    if (handle.includes('e')) x1 = clamp(x1 + dx, x0 + min, W());
+    if (handle.includes('n')) y0 = clamp(y0 + dy, 0, y1 - min);
+    if (handle.includes('s')) y1 = clamp(y1 + dy, y0 + min, H());
+    if (state.shape === 'circle') {
+      // Lingkaran tetap bulat: kotak dijaga persegi, ditarik dari sudut seberangnya.
+      const side = Math.max(x1 - x0, y1 - y0);
+      if (handle.includes('w')) x0 = x1 - side; else x1 = x0 + side;
+      if (handle.includes('n')) y0 = y1 - side; else y1 = y0 + side;
+    }
+  }
+  state.box = { x: x0 / W(), y: y0 / H(), w: (x1 - x0) / W(), h: (y1 - y0) / H() };
   areaChanged();
 }
 
@@ -240,9 +408,10 @@ function drawComposite(c, placeholder = false) {
   if (state.area) {
     const r = areaPx();
     c.save();
-    // Klip ke kotak area; bentuk lubang sebenarnya ditentukan oleh bingkai di atasnya.
+    // Klip ke lingkaran (mode bulat) atau kotak; sisanya tertutup bingkai di atasnya.
     c.beginPath();
-    c.rect(r.x, r.y, r.w, r.h);
+    if (state.shape === 'circle') c.ellipse(r.x + r.w / 2, r.y + r.h / 2, r.w / 2, r.h / 2, 0, 0, Math.PI * 2);
+    else c.rect(r.x, r.y, r.w, r.h);
     c.clip();
     if (state.photo) {
       const { width: w, height: h } = state.photo;
@@ -301,16 +470,43 @@ function render() {
   });
 }
 
-/** Titik kuning = tempat yang diketuk; kotak tipis = batas penempatan foto. */
+/** Titik kuning = tempat yang diketuk; kotak putus-putus = batas foto (bisa ditarik/digeser). */
 function drawSeeds() {
   const u = 1 / cssPerPx; // 1 px CSS dalam satuan template
   if (state.area) {
     const r = areaPx();
-    ctx.setLineDash([5 * u, 4 * u]);
-    ctx.strokeStyle = 'rgba(28, 28, 30, 0.55)';
-    ctx.lineWidth = 1.5 * u;
+    ctx.lineWidth = 3.5 * u;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
     ctx.strokeRect(r.x, r.y, r.w, r.h);
+    ctx.setLineDash([6 * u, 4 * u]);
+    ctx.strokeStyle = '#1c1c1e';
+    ctx.lineWidth = 1.75 * u;
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    if (state.shape === 'circle') {
+      // Lingkaran di dalam kotak = bentuk lubang foto.
+      ctx.beginPath();
+      ctx.ellipse(r.x + r.w / 2, r.y + r.h / 2, r.w / 2, r.h / 2, 0, 0, Math.PI * 2);
+      ctx.setLineDash([]);
+      ctx.lineWidth = 4 * u;
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+      ctx.stroke();
+      ctx.setLineDash([7 * u, 5 * u]);
+      ctx.lineWidth = 2 * u;
+      ctx.strokeStyle = '#1c1c1e';
+      ctx.stroke();
+    }
     ctx.setLineDash([]);
+    const pts = handlePoints(r);
+    for (const h of activeHandles()) {
+      const [x, y] = pts[h];
+      ctx.beginPath();
+      ctx.arc(x, y, (h.length === 2 ? 7 : 5.5) * u, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.lineWidth = 2 * u;
+      ctx.strokeStyle = '#1c1c1e';
+      ctx.stroke();
+    }
   }
   for (const s of state.seeds) {
     ctx.beginPath();
@@ -341,7 +537,10 @@ el.view.addEventListener('pointerdown', (e) => {
   pointers.set(e.pointerId, p);
 
   if (state.step === 2) {
-    drag = pointers.size === 1 ? { kind: 'tap', start: p } : null;
+    if (pointers.size !== 1) { drag = null; return; }
+    const hit = hitBox(p, e.pointerType === 'touch');
+    // Pegangan = ubah ukuran; di dalam kotak = ketuk, atau geser kotak bila pointer ditarik.
+    drag = { kind: hit && hit !== 'move' ? 'box' : 'tap', handle: hit, start: p, from: state.area && areaPx() };
     return;
   }
 
@@ -359,7 +558,14 @@ el.view.addEventListener('pointermove', (e) => {
   if (!drag) return;
 
   if (drag.kind === 'tap') {
-    if (Math.hypot(p.x - drag.start.x, p.y - drag.start.y) * cssPerPx > 8) drag.moved = true;
+    if (Math.hypot(p.x - drag.start.x, p.y - drag.start.y) * cssPerPx <= 8) return;
+    drag.moved = true;
+    if (drag.handle !== 'move') return;
+    drag.kind = 'box';
+  }
+  if (drag.kind === 'box') {
+    if (!drag.pushed) { pushHistory(); drag.pushed = true; }
+    adjustBox(drag.from, drag.handle, p.x - drag.start.x, p.y - drag.start.y);
     return;
   }
   if (pointers.size >= 2 && drag.kind === 'pinch') {
@@ -402,6 +608,11 @@ function endPointer(e) {
     else if (pointers.size === 0) { drag = null; el.stage.classList.remove('dragging'); }
   }
 }
+// Kursor penunjuk pegangan saat mouse melayang di atas kotak (desktop).
+el.view.addEventListener('pointermove', (e) => {
+  if (state.step !== 2 || pointers.size || e.pointerType === 'touch') return;
+  el.view.style.cursor = CURSORS[hitBox(toTemplate(e), false)] || '';
+});
 el.view.addEventListener('pointerup', endPointer);
 el.view.addEventListener('pointercancel', endPointer);
 
@@ -419,13 +630,23 @@ el.view.addEventListener('wheel', (e) => {
 /* ================= Keyboard ================= */
 
 el.stage.addEventListener('keydown', (e) => {
+  const dirs = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  const dir = dirs[e.key];
+  // Langkah 2: panah menggeser kotak foto, Shift + panah melebarkan/menyempitkan sisi kanan/bawah.
+  if (state.step === 2 && state.area && dir) {
+    e.preventDefault();
+    pushHistory();
+    const step = Math.max(2, Math.min(W(), H()) * 0.01);
+    if (e.shiftKey && state.shape === 'circle') adjustBox(areaPx(), 'se', (dir[0] || dir[1]) * step, (dir[0] || dir[1]) * step);
+    else if (e.shiftKey) adjustBox(areaPx(), dir[0] ? 'e' : 's', dir[0] * step, dir[1] * step);
+    else adjustBox(areaPx(), 'move', dir[0] * step, dir[1] * step);
+    return;
+  }
   if (state.step !== 3 || !state.source) return;
   if (!state.photo) {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.photoInput.click(); }
     return;
   }
-  const dirs = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
-  const dir = dirs[e.key];
   const r = areaPx();
   if (dir) {
     e.preventDefault();
@@ -611,11 +832,11 @@ function hintText() {
   if (state.step === 3) return state.photo ? 'Geser foto untuk mengatur posisi.' : 'Ketuk area foto atau tombol Pilih foto.';
   if (!state.area) return 'Ketuk bagian putih tempat foto akan muncul.';
   if (state.detected && !state.history.length) {
-    return state.detected === 'hole'
-      ? 'Lubang transparan terdeteksi otomatis. Ketuk bagian putih lain bila perlu.'
-      : 'Area putih terdeteksi otomatis. Ketuk sisa putih bila masih ada.';
+    return state.shape === 'circle'
+      ? 'Lubang bulat terdeteksi. Tarik sudut kotak bila lingkarannya kurang pas.'
+      : 'Area terdeteksi otomatis. Tarik titik kotak bila kurang pas.';
   }
-  return 'Ketuk sisa putih bila masih ada, lalu Lanjut.';
+  return 'Ketuk sisa putih, atau tarik titik kotak untuk merapikan area foto.';
 }
 
 function goStep(n) {
@@ -627,7 +848,7 @@ function goStep(n) {
   el.stage.classList.toggle('mode-photo', n === 3);
   el.photoControls.hidden = n !== 3;
   el.stage.setAttribute('aria-label', n === 2
-    ? 'Editor area foto. Ketuk bagian putih untuk menjadikannya tempat foto.'
+    ? 'Editor area foto. Ketuk bagian putih untuk menjadikannya tempat foto. Panah menggeser kotak foto, Shift dan panah mengubah ukurannya.'
     : n === 3 ? 'Pratinjau Twibbon. Panah untuk menggeser foto, plus dan minus untuk zoom.' : 'Pratinjau bingkai');
   drag = null;
   pointers.clear();
@@ -655,6 +876,7 @@ function updateUI() {
   el.hint.textContent = hintText();
   el.undo.disabled = state.history.length === 0;
   el.toPhoto.disabled = !state.area;
+  $$('[data-shape]').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.shape === state.shape)));
   $('#photoBtn').textContent = hasPhoto ? 'Ganti foto' : 'Pilih foto';
   el.zoom.disabled = !hasPhoto;
   el.resetPos.disabled = !hasPhoto;
@@ -725,6 +947,7 @@ document.addEventListener('paste', (e) => {
 $$('.step').forEach((b) => b.addEventListener('click', () => goStep(Number(b.dataset.step))));
 el.toPhoto.addEventListener('click', () => goStep(3));
 el.undo.addEventListener('click', undo);
+$$('[data-shape]').forEach((b) => b.addEventListener('click', () => setShape(b.dataset.shape)));
 el.resetArea.addEventListener('click', resetArea);
 
 el.zoom.addEventListener('input', () => state.photo && zoomCenter(Number(el.zoom.value)));

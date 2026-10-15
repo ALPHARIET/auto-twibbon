@@ -267,6 +267,16 @@ input[type="range"]::-webkit-slider-thumb {
 input[type="range"]::-moz-range-thumb { width: 18px; height: 18px; border-radius: 50%; background: var(--yellow); border: 2px solid var(--primary); }
 input[type="range"]:disabled { opacity: 0.4; }
 
+.segmented {
+  display: flex; padding: 4px; gap: 2px; width: 100%;
+  background: var(--surface); border-radius: var(--r-full);
+}
+.segmented button {
+  flex: 1; min-height: 36px; padding: 6px 10px; border: 0; border-radius: var(--r-full);
+  background: transparent; color: var(--steel); font-size: 14px; font-weight: 500; cursor: pointer;
+}
+.segmented button[aria-checked="true"] { background: var(--primary); color: var(--on-primary); }
+
 /* ---------- Halaman PDF: satu baris yang bisa digeser ---------- */
 .pdf-pages { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .page-grid { display: flex; gap: 8px; overflow-x: auto; padding: 2px 2px 6px; scroll-snap-type: x proximity; }
