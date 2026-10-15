@@ -15,7 +15,6 @@ export class UserError extends Error {}
 /** Kenali jenis berkas dari isinya, bukan dari ekstensi. */
 export async function sniff(file) {
   const head = new Uint8Array(await file.slice(0, 1024).arrayBuffer());
-  if (!head.length) return 'empty';
   if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) return 'png';
   if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return 'jpeg';
   const text = new TextDecoder('latin1').decode(head);
@@ -31,7 +30,7 @@ export async function sniff(file) {
     if (brands.some((b) => /^(heic|heix|hevc|hevx|heim|heis|mif1|msf1)$/.test(b))) return 'heic';
     return 'unknown';
   }
-  if (text.slice(0, 1024).includes('%PDF-')) return 'pdf';
+  if (text.includes('%PDF-')) return 'pdf';
   return 'unknown';
 }
 
@@ -47,7 +46,7 @@ export function checkSize(file, max, what) {
 }
 
 /** Decode gambar dengan orientasi EXIF diterapkan. */
-export async function decodeImage(blob) {
+async function decodeImage(blob) {
   try {
     if ('createImageBitmap' in window) {
       return await createImageBitmap(blob, { imageOrientation: 'from-image' });
@@ -69,9 +68,9 @@ export async function decodeImage(blob) {
   }
 }
 
-export const sizeOf = (img) => ({ w: img.naturalWidth || img.width, h: img.naturalHeight || img.height });
+const sizeOf = (img) => ({ w: img.naturalWidth || img.width, h: img.naturalHeight || img.height });
 
-export function checkPixels(img, what) {
+function checkPixels(img, what) {
   const { w, h } = sizeOf(img);
   if (!w || !h) throw new UserError(`${what} tidak bisa dibaca. Coba berkas lain.`);
   if (w * h > LIMITS.maxPixels) {
@@ -80,7 +79,7 @@ export function checkPixels(img, what) {
 }
 
 /** Gambar ke kanvas baru dengan sisi terpanjang maksimal `maxSide` (tidak diperbesar). */
-export function toCanvas(img, maxSide) {
+function toCanvas(img, maxSide) {
   const { w, h } = sizeOf(img);
   const k = Math.min(1, maxSide / Math.max(w, h));
   const c = document.createElement('canvas');
@@ -97,16 +96,21 @@ export function toCanvas(img, maxSide) {
 export function unsupportedMessage(kind, accepted) {
   if (kind === 'heic') return 'Browser ini belum bisa membaca foto HEIC. Ubah ke JPG dulu (di iPhone: Pengaturan › Kamera › Format › Paling Kompatibel), lalu pilih lagi.';
   if (kind === 'avif') return 'Browser ini belum bisa membaca AVIF. Perbarui browser atau ubah gambar ke JPG/PNG.';
-  if (kind === 'empty') return 'Berkas kosong. Pilih berkas lain.';
   return `Format berkas tidak didukung. Gunakan ${accepted}.`;
 }
 
-/** Decode; bila browser tidak mampu membaca format ini, beri pesan khusus format. */
-export async function decodeAs(file, kind, accepted) {
+/**
+ * Baca gambar jadi kanvas (sisi terpanjang maks. `maxSide`), dengan cek megapiksel.
+ * Bila browser tidak mampu membaca format ini (HEIC/AVIF), beri pesan khusus format.
+ */
+export async function loadImage(file, kind, { what, accepted, maxSide }) {
+  let img;
   try {
-    return await decodeImage(file);
+    img = await decodeImage(file);
   } catch (err) {
     if (kind === 'heic' || kind === 'avif') throw new UserError(unsupportedMessage(kind, accepted));
     throw err;
   }
+  checkPixels(img, what);
+  return toCanvas(img, maxSide);
 }

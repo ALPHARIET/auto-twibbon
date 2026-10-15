@@ -7,10 +7,12 @@ Desain mengikuti [`DESIGN.md`](DESIGN.md) (Miro, dari [VoltAgent/awesome-design-
 ## Alur
 
 1. **Bingkai**: unggah PNG, JPG, WebP, AVIF, atau PDF (maks. 20 MB, PDF maks. 20 halaman, pilih satu halaman). PNG/WebP transparan tetap dipertahankan; bingkai JPG dilubangi lewat ketuk warna.
-2. **Area foto** (ketuk warna): ketuk bagian polos (mis. putih). Hanya warna yang tersambung yang dihapus, jadi tulisan/ornamen yang menimpa area foto tetap utuh. Ketuk lagi untuk sisa yang terkurung huruf; ada urungkan dan reset.
+2. **Area foto** (ketuk warna): ketuk bagian polos (mis. putih). Hanya warna yang tersambung yang dihapus, jadi tulisan/ornamen yang menimpa area foto tetap utuh. Toleransi warna dipilih otomatis per ketukan, sehingga elemen yang warnanya mirip (mis. kertas atau label abu-abu muda) tidak ikut terhapus. Ketuk lagi untuk sisa yang terkurung huruf; ada urungkan dan reset.
 
    Otomatis: lubang transparan di PNG/WebP terdeteksi tanpa mengubah piksel bingkai, dan bila tidak ada, area polos di tengah bingkai langsung dipilih.
 3. **Foto & unduh**: foto mengisi area (cover), bisa digeser, dicubit/scroll untuk zoom, lalu diunduh sebagai PNG dengan ukuran template.
+
+Di desktop, bingkai dan foto juga bisa ditempel dari clipboard (Ctrl+V / ⌘V). Di langkah foto, gambar yang ditempel menjadi foto; di langkah lain menjadi bingkai.
 
 Tampilan dibuat satu layar penuh tanpa scroll, baik di HP (tegak maupun mendatar) maupun desktop.
 
@@ -47,4 +49,5 @@ Impor repo di Vercel. Framework terdeteksi sebagai Vite (build `npm run build`, 
 
 - HEIC dan AVIF dibaca oleh browser sendiri: HEIC jalan di Safari (iOS/macOS); di browser lain muncul pesan untuk mengubah ke JPG. GIF hanya frame pertama. SVG sengaja tidak didukung.
 - Fitur PRD yang butuh server (login, draft/publikasi, kepemilikan acara) diganti oleh template PNG + `?t=`.
-- pdf.js hanya diunduh saat pengguna membuka PDF; halaman awal sekitar 15 KB JS+CSS (gzip) ditambah font.
+- Halaman awal sekitar 26 KB dalam 3 request: HTML (CSS sudah ditanam di dalamnya), JS ~10 KB, dan font ~10 KB yang di-preload. pdf.js hanya diunduh saat pengguna membuka PDF.
+- Font `src/fonts/plus-jakarta-sans.woff2` adalah Plus Jakarta Sans (OFL, lihat `src/fonts/OFL.txt`) yang dipangkas ke huruf Latin dasar + `· × … › −` dan ketebalan 400–600. Kalau UI memakai karakter atau ketebalan baru, buat ulang subset-nya dengan fonttools (`varLib.instancer` lalu `pyftsubset`).

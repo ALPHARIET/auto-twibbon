@@ -1,11 +1,10 @@
-import '@fontsource-variable/plus-jakarta-sans/wght.css';
 import './style.css';
 import {
-  LIMITS, UserError, sniff, checkSize, decodeAs, checkPixels, toCanvas, sizeOf, unsupportedMessage,
+  LIMITS, UserError, sniff, checkSize, loadImage, unsupportedMessage,
   FRAME_IMAGES, PHOTO_IMAGES,
 } from './files.js';
 import { detectHole } from './detect.js';
-import { floodRemoval, autoSeed, DEFAULT_TOL } from './fill.js';
+import { floodRemoval, autoSeed, pickTolerance } from './fill.js';
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
@@ -29,6 +28,7 @@ const state = {
   area: null, // { x, y, w, h } relatif 0..1: kotak tempat foto diletakkan; null = belum ada
   seeds: [], // titik relatif yang diketuk (atau terdeteksi otomatis)
   srcData: null, // piksel bingkai sumber (cache untuk flood fill)
+  small: null, // salinan kecil bingkai untuk mencari toleransi dengan cepat
   fillCache: null,
   initialSeeds: [], // untuk reset
   detected: null, // 'hole' | 'fill' | null
@@ -43,7 +43,8 @@ const state = {
 const W = () => state.source.width;
 const H = () => state.source.height;
 
-function areaPx(a = state.area) {
+function areaPx() {
+  const a = state.area;
   return { x: a.x * W(), y: a.y * H(), w: a.w * W(), h: a.h * H() };
 }
 
@@ -56,11 +57,38 @@ function sourceData() {
   return state.srcData;
 }
 
+/** Salinan bingkai maks. 640 px tanpa pencampuran warna (nearest neighbour). */
+function smallData() {
+  if (!state.small) {
+    const k = Math.min(1, 640 / Math.max(W(), H()));
+    const w = Math.max(1, Math.round(W() * k)), h = Math.max(1, Math.round(H() * k));
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.imageSmoothingEnabled = false;
+    g.drawImage(state.source, 0, 0, w, h);
+    state.small = { data: g.getImageData(0, 0, w, h).data, w, h };
+  }
+  return state.small;
+}
+
+/**
+ * Toleransi otomatis untuk satu titik, dihitung di salinan kecil agar cepat di bingkai besar.
+ * Area yang sangat kecil (mis. sela huruf) dihitung ulang di resolusi penuh supaya tetap akurat.
+ */
+function toleranceFor(seed) {
+  const s = smallData();
+  const tol = pickTolerance(s.data, s.w, s.h, seed);
+  if (s.w === W()) return tol;
+  const { count } = floodRemoval(s.data, s.w, s.h, [{ ...seed, tol }], tol, { feather: false });
+  return count < 200 ? pickTolerance(sourceData(), W(), H(), seed) : tol;
+}
+
 /** Hasil flood fill untuk titik-titik saat ini (di-cache selama titiknya sama). */
 function fillResult() {
-  const key = state.seeds.map((s) => `${s.x},${s.y}`).join(';');
+  const key = state.seeds.map((s) => `${s.x},${s.y},${s.tol}`).join(';');
   if (state.fillCache?.key !== key) {
-    state.fillCache = { key, res: floodRemoval(sourceData(), W(), H(), state.seeds, DEFAULT_TOL) };
+    state.fillCache = { key, res: floodRemoval(sourceData(), W(), H(), state.seeds) };
   }
   return state.fillCache.res;
 }
@@ -94,9 +122,10 @@ function rebuildFrame() {
 function setFrame(canvas, { shared = false } = {}) {
   state.source = canvas;
   state.srcData = null;
+  state.small = null;
   state.fillCache = null;
   const hole = detectHole(canvas);
-  const auto = hole ? null : autoSeed(sourceData(), W(), H());
+  const auto = hole ? null : autoSeed(smallData().data, smallData().w, smallData().h);
   const seed = hole || auto;
   state.detected = hole ? 'hole' : auto ? 'fill' : null;
   state.seeds = seed ? [seed] : [];
@@ -130,7 +159,7 @@ function resetArea() {
 }
 
 /** Ketuk: tambah titik dan hapus warna yang tersambung dengannya. */
-function addSeed(p) {
+async function addSeed(p) {
   const x = clamp(p.x, 0, W() - 1);
   const y = clamp(p.y, 0, H() - 1);
   const before = state.seeds.length ? fillResult() : null;
@@ -138,8 +167,14 @@ function addSeed(p) {
     return toast('Bagian ini sudah termasuk area foto. Ketuk bagian lain yang masih tersisa.');
   }
   pushHistory();
-  state.seeds = [...state.seeds, { x: x / W(), y: y / H() }];
+  const seed = { x: x / W(), y: y / H() };
+  busy('Memproses…');
+  await new Promise((r) => requestAnimationFrame(() => setTimeout(r)));
+  // Toleransi dipilih otomatis agar tidak bocor ke elemen yang warnanya mirip.
+  seed.tol = toleranceFor(seed);
+  state.seeds = [...state.seeds, seed];
   areaChanged();
+  busy(false);
   const res = fillResult();
   if (res.count > W() * H() * 0.6) {
     toast('Pilihan meluas ke sebagian besar bingkai. Urungkan, lalu ketuk bagian lain.', true);
@@ -162,8 +197,7 @@ function areaChanged() {
 
 function coverScale() {
   const r = areaPx();
-  const { w, h } = sizeOf(state.photo);
-  return Math.max(r.w / w, r.h / h);
+  return Math.max(r.w / state.photo.width, r.h / state.photo.height);
 }
 
 function resetPos() {
@@ -173,7 +207,7 @@ function resetPos() {
 
 function clampPos() {
   const r = areaPx();
-  const { w, h } = sizeOf(state.photo);
+  const { width: w, height: h } = state.photo;
   const p = state.pos;
   p.zoom = clamp(p.zoom, 1, 4);
   const s = coverScale() * p.zoom;
@@ -211,7 +245,7 @@ function drawComposite(c, placeholder = false) {
     c.rect(r.x, r.y, r.w, r.h);
     c.clip();
     if (state.photo) {
-      const { w, h } = sizeOf(state.photo);
+      const { width: w, height: h } = state.photo;
       const s = coverScale() * state.pos.zoom;
       c.imageSmoothingQuality = 'high';
       c.drawImage(state.photo, state.pos.cx - (w * s) / 2, state.pos.cy - (h * s) / 2, w * s, h * s);
@@ -419,9 +453,7 @@ async function handleFrameFile(file, shared = false) {
         : unsupportedMessage(kind, accepted));
     }
     busy('Membaca bingkai…');
-    const img = await decodeAs(file, kind, accepted);
-    checkPixels(img, 'Bingkai');
-    const canvas = toCanvas(img, LIMITS.outSide);
+    const canvas = await loadImage(file, kind, { what: 'Bingkai', accepted, maxSide: LIMITS.outSide });
     closePdf();
     setFrame(canvas, { shared });
   } catch (err) {
@@ -500,9 +532,7 @@ async function handlePhotoFile(file) {
     const accepted = 'foto JPG, PNG, WebP, atau HEIC';
     if (!PHOTO_IMAGES.includes(kind)) throw new UserError(unsupportedMessage(kind, accepted));
     busy('Menyiapkan foto…');
-    const img = await decodeAs(file, kind, accepted);
-    checkPixels(img, 'Foto');
-    setPhoto(toCanvas(img, LIMITS.photoSide));
+    setPhoto(await loadImage(file, kind, { what: 'Foto', accepted, maxSide: LIMITS.photoSide }));
   } catch (err) {
     fail(err);
   } finally {
@@ -521,20 +551,16 @@ function setPhoto(canvas) {
 
 /* ================= Ekspor ================= */
 
-function canvasToBlob(c) {
-  return new Promise((resolve, reject) => {
-    c.toBlob((b) => (b ? resolve(b) : reject(new UserError('Memori perangkat tidak cukup untuk membuat gambar. Tutup tab lain atau pakai foto yang lebih kecil.'))), 'image/png');
-  });
-}
-
-async function renderResult() {
+function renderResult() {
   const c = document.createElement('canvas');
   c.width = W();
   c.height = H();
   const cx = c.getContext('2d');
   if (!cx) throw new UserError('Memori perangkat tidak cukup. Tutup tab lain lalu coba lagi.');
   drawComposite(cx);
-  return canvasToBlob(c);
+  return new Promise((resolve, reject) => {
+    c.toBlob((b) => (b ? resolve(b) : reject(new UserError('Memori perangkat tidak cukup untuk membuat gambar. Tutup tab lain atau pakai foto yang lebih kecil.'))), 'image/png');
+  });
 }
 
 function saveBlob(blob, name) {
@@ -681,6 +707,21 @@ el.photoInput.addEventListener('change', () => {
   if (f) handlePhotoFile(f);
 });
 
+// Tempel (Ctrl+V) & tarik-lepas: langkah 3 menerima foto, langkah lain menerima bingkai.
+const takeFile = (f) => (state.step === 3 ? handlePhotoFile(f) : handleFrameFile(f));
+
+document.addEventListener('paste', (e) => {
+  const items = [...(e.clipboardData?.items || [])];
+  const item = items.find((i) => i.kind === 'file' && (i.type.startsWith('image/') || i.type === 'application/pdf'));
+  if (!item) {
+    if (items.some((i) => i.kind === 'string')) toast('Clipboard tidak berisi gambar. Salin gambarnya (bukan link-nya), lalu tempel lagi.', true);
+    return;
+  }
+  e.preventDefault();
+  const f = item.getAsFile();
+  if (f) takeFile(f);
+});
+
 $$('.step').forEach((b) => b.addEventListener('click', () => goStep(Number(b.dataset.step))));
 el.toPhoto.addEventListener('click', () => goStep(3));
 el.undo.addEventListener('click', undo);
@@ -699,7 +740,6 @@ try {
   if (navigator.canShare && navigator.canShare({ files: [probe] }) && matchMedia('(pointer: coarse)').matches) el.share.hidden = false;
 } catch { /* tidak didukung */ }
 
-// Tarik & lepas: langkah 3 menerima foto, selain itu bingkai.
 ['dragenter', 'dragover'].forEach((t) => el.stage.addEventListener(t, (e) => {
   e.preventDefault();
   el.stage.classList.add('drag-over');
@@ -711,12 +751,10 @@ try {
 }));
 el.stage.addEventListener('drop', (e) => {
   const f = e.dataTransfer?.files?.[0];
-  if (!f) return;
-  if (state.step === 3) handlePhotoFile(f); else handleFrameFile(f);
+  if (f) takeFile(f);
 });
 
-new ResizeObserver(() => layoutView()).observe(el.stage);
-window.addEventListener('resize', layoutView);
+new ResizeObserver(layoutView).observe(el.stage);
 
 // Template bersama: ?t=nama memuat /templates/nama.png (taruh berkasnya di folder public/templates).
 const shared = new URLSearchParams(location.search).get('t');

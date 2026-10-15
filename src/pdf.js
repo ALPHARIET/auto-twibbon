@@ -1,15 +1,12 @@
 // pdf.js hanya dimuat saat pengguna membuka PDF, supaya halaman awal tetap ringan.
+import workerSrc from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import { LIMITS, UserError } from './files.js';
 
 let lib;
 async function load() {
   if (!lib) {
-    const [mod, worker] = await Promise.all([
-      import('pdfjs-dist/legacy/build/pdf.min.mjs'),
-      import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'),
-    ]);
-    mod.GlobalWorkerOptions.workerSrc = worker.default;
-    lib = mod;
+    lib = await import('pdfjs-dist/legacy/build/pdf.min.mjs');
+    lib.GlobalWorkerOptions.workerSrc = workerSrc;
   }
   return lib;
 }

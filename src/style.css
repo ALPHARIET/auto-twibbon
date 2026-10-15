@@ -1,3 +1,13 @@
+/* Plus Jakarta Sans (OFL, lihat fonts/OFL.txt) yang dipangkas: hanya huruf yang dipakai
+   web ini dan ketebalan 400–600, supaya font cuma ~10 KB. */
+@font-face {
+  font-family: 'Plus Jakarta Sans Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400 600;
+  src: url('./fonts/plus-jakarta-sans.woff2') format('woff2');
+}
+
 /* Token mengikuti DESIGN.md (Miro): kanvas putih, aksen kuning, CTA pill. */
 :root {
   --primary: #1c1c1e;
